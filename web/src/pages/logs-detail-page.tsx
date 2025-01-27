@@ -107,7 +107,7 @@ const LogsDetailPage: React.FC<LogsDetailPageProps> = ({
 
   const handleLoadMoreData = (lastTimestamp: number) => {
     if (!isLoadingMoreLogsData) {
-      getMoreLogs({ lastTimestamp, query });
+      getMoreLogs({ lastTimestamp, query, namespace, direction });
     }
   };
 
