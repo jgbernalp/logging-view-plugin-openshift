@@ -15,6 +15,7 @@ import {
 } from '../logs.types';
 import { parseName, parseResources, ResourceLabel } from '../parse-resources';
 import { severityFromString } from '../severity';
+import { numericComparator } from '../sort-utils';
 import { TestIds } from '../test-ids';
 import { LogDetail } from './log-detail';
 import './logs-table.css';
@@ -37,8 +38,6 @@ interface LogsTableProps {
   hasNamespaceFilter?: boolean;
   schema: Schema;
 }
-
-type TableCellValue = string | number | Resource | Array<Resource>;
 
 const isJSONObject = (value: string): boolean => {
   const trimmedValue = value.trim();
@@ -96,13 +95,6 @@ const getSeverityClass = (severity: string) => {
   return severity ? `lv-plugin__table__severity-${severity}` : '';
 };
 
-// sort with an appropriate numeric comparator for big floats
-const numericComparator = <T extends TableCellValue>(
-  a: T,
-  b: T,
-  directionMultiplier: number,
-): number => (a < b ? -1 : a > b ? 1 : 0) * directionMultiplier;
-
 const columns: Array<TableColumn<LogTableData>> = [
   {
     id: 'expand',
@@ -119,7 +111,12 @@ const columns: Array<TableColumn<LogTableData>> = [
     },
     sort: (data, sortDirection) =>
       data.sort((a, b) =>
-        numericComparator(a.timestamp, b.timestamp, sortDirection === 'asc' ? 1 : -1),
+        numericComparator(
+          a.timestamp,
+          b.timestamp,
+          sortDirection === 'asc' ? 1 : -1,
+          a.logIndex - b.logIndex,
+        ),
       ),
   },
   {
@@ -306,7 +303,9 @@ export const LogsTable: React.FC<LogsTableProps> = ({
       }
     }
 
-    return tableData.sort((a, b) => numericComparator(a.timestamp, b.timestamp, -1));
+    return tableData.sort((a, b) =>
+      numericComparator(a.timestamp, b.timestamp, -1, a.logIndex - b.logIndex),
+    );
   }, [tableData, columns, sortBy]);
 
   const dataIsEmpty = sortedData.length === 0;
