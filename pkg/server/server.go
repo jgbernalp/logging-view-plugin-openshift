@@ -31,6 +31,62 @@ type Config struct {
 	StaticPath       string
 	ConfigPath       string
 	PluginConfigPath string
+	TLSMinVersion    uint16
+	TLSCipherSuites  []uint16
+}
+
+func (cfg *Config) IsTLSEnabled() bool {
+	return cfg.CertFile != "" && cfg.PrivateKeyFile != ""
+}
+
+func (cfg *Config) ValidateTLSConfig() error {
+	certSet := cfg.CertFile != ""
+	keySet := cfg.PrivateKeyFile != ""
+
+	if certSet != keySet {
+		return fmt.Errorf("both CertFile and PrivateKeyFile must be provided to enable TLS")
+	}
+
+	if !certSet && !keySet {
+		return nil
+	}
+
+	if _, err := os.Stat(cfg.CertFile); err != nil {
+		return fmt.Errorf("cert file error: %v", err)
+	}
+
+	if _, err := os.Stat(cfg.PrivateKeyFile); err != nil {
+		return fmt.Errorf("key file error: %v", err)
+	}
+
+	return nil
+}
+
+type PluginServer struct {
+	*http.Server
+	Config *Config
+	cancel context.CancelFunc
+}
+
+// StartHTTPServer starts the HTTP orHTTPS server
+func (s *PluginServer) StartHTTPServer() error {
+	if s.Config.IsTLSEnabled() {
+		slog.Infof("listening for https on %s", s.Addr)
+		return s.ListenAndServeTLS(s.Config.CertFile, s.Config.PrivateKeyFile)
+	}
+	slog.Infof("listening for http on %s", s.Addr)
+	return s.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the server
+func (s *PluginServer) Shutdown(ctx context.Context) error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.Server != nil {
+		return s.Server.Shutdown(ctx)
+	}
+	return nil
 }
 
 type PluginConfig struct {
@@ -55,7 +111,11 @@ func (pluginConfig *PluginConfig) MarshalJSON() ([]byte, error) {
 	})
 }
 
-func Start(cfg *Config) {
+func CreateServer(ctx context.Context, cfg *Config) (*PluginServer, error) {
+	if err := cfg.ValidateTLSConfig(); err != nil {
+		return nil, fmt.Errorf("TLS config validation failed: %v", err)
+	}
+
 	router := setupRoutes(cfg)
 	router.Use(corsHeaderMiddleware(cfg))
 
@@ -64,19 +124,32 @@ func Start(cfg *Config) {
 		MinVersion: tls.VersionTLS12,
 	}
 
-	tlsEnabled := cfg.CertFile != "" && cfg.PrivateKeyFile != ""
-	if tlsEnabled {
+	// Apply custom TLS settings if provided
+	if cfg.TLSMinVersion != 0 {
+		tlsConfig.MinVersion = cfg.TLSMinVersion
+	}
+
+	if len(cfg.TLSCipherSuites) > 0 {
+		tlsConfig.CipherSuites = cfg.TLSCipherSuites
+	}
+
+	var cancel context.CancelFunc
+	if cfg.IsTLSEnabled() {
+		var serverCtx context.Context
+		serverCtx, cancel = context.WithCancel(ctx)
+
 		// Build and run the controller which reloads the certificate and key
 		// files whenever they change.
-		ctx := context.Background()
 
 		certKeyPair, err := dynamiccertificates.NewDynamicServingContentFromFiles("serving-cert", cfg.CertFile, cfg.PrivateKeyFile)
 		if err != nil {
-			slog.WithError(err).Fatal("unable to create TLS controller")
+			cancel()
+			return nil, fmt.Errorf("unable to create TLS controller: %v", err)
 		}
 
-		if err := certKeyPair.RunOnce(ctx); err != nil {
-			slog.WithError(err).Fatal("failed to initialize cert/key content")
+		if err := certKeyPair.RunOnce(serverCtx); err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to initialize cert/key content: %v", err)
 		}
 
 		eventBroadcaster := record.NewBroadcaster()
@@ -100,8 +173,8 @@ func Start(cfg *Config) {
 		// Notify cert/key file changes to the controller.
 		certKeyPair.AddListener(ctrl)
 
-		go ctrl.Run(1, ctx.Done())
-		go certKeyPair.Run(ctx, 1)
+		go ctrl.Run(1, serverCtx.Done())
+		go certKeyPair.Run(serverCtx, 1)
 	}
 
 	httpServer := &http.Server{
@@ -117,12 +190,22 @@ func Start(cfg *Config) {
 		httpServer.Handler = loggedRouter
 	}
 
-	if tlsEnabled {
-		slog.Infof("listening for https on %s", httpServer.Addr)
-		panic(httpServer.ListenAndServeTLS(cfg.CertFile, cfg.PrivateKeyFile))
-	} else {
-		slog.Infof("listening for http on %s", httpServer.Addr)
-		panic(httpServer.ListenAndServe())
+	return &PluginServer{
+		Server: httpServer,
+		Config: cfg,
+		cancel: cancel,
+	}, nil
+}
+
+func Start(cfg *Config) {
+	ctx := context.Background()
+	srv, err := CreateServer(ctx, cfg)
+	if err != nil {
+		slog.WithError(err).Fatal("failed to create server")
+	}
+
+	if err := srv.StartHTTPServer(); err != nil {
+		slog.WithError(err).Fatal("failed to start server")
 	}
 }
 
@@ -146,6 +229,24 @@ func setupRoutes(cfg *Config) *mux.Router {
 	return r
 }
 
+type headerPreservingWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *headerPreservingWriter) WriteHeader(statusCode int) {
+	if !w.wroteHeader {
+		if w.Header().Get("Cache-Control") == "" {
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		}
+		if w.Header().Get("Expires") == "" {
+			w.Header().Set("Expires", "0")
+		}
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
 func filesHandler(root http.FileSystem) http.Handler {
 	fileServer := http.FileServer(root)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +256,8 @@ func filesHandler(root http.FileSystem) http.Handler {
 		if strings.HasPrefix(filePath, "/plugin-entry.js") {
 			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 			w.Header().Set("Expires", "0")
+			fileServer.ServeHTTP(&headerPreservingWriter{ResponseWriter: w}, r)
+			return
 		}
 
 		fileServer.ServeHTTP(w, r)
