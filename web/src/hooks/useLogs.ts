@@ -17,10 +17,10 @@ import {
   executeVolumeRange,
 } from '../loki-client';
 import { intervalFromTimeRange, numericTimeRange, timeRangeFromDuration } from '../time-range';
-import { msToNs } from '../value-utils';
 
 import { LogQLQuery } from '../logql-query';
 import { LogsContext } from './LogsConfigProvider';
+import { msToNs } from '../value-utils';
 
 const DEFAULT_TIME_SPAN = '1h';
 const STREAMING_MAX_LOGS_LIMIT = 1e3;
